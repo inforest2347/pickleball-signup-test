@@ -200,9 +200,50 @@
       $('status').hidden = true;
       form.hidden = false;
     } catch (err) {
-      $('status').textContent = '無法連接 LINE，請從官方帳號的選單重新開啟報名表。';
+      // 測試期間顯示實際錯誤，上線前可改回簡單的提示文字
+      $('status').textContent = '無法連接 LINE（' + (err.code || '無錯誤代碼') + '）：' + (err.message || err);
       console.error(err);
     }
+  }
+
+  // 每次開啟表單產生一個送出編號；重送時沿用，GAS 以此避免重複報名
+  let submissionId = null;
+
+  function newSubmissionId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+  }
+
+  /** 送出一次；回傳 GAS 的 JSON，若逾時或回應不是 JSON 則回傳 null（結果未知） */
+  async function postSignup(payload) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try {
+      // text/plain 可避免瀏覽器先發 OPTIONS 預檢，GAS 不支援預檢
+      const res = await fetch(GAS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (parseError) {
+        console.warn('GAS 回應不是 JSON：', text.slice(0, 200));
+        return null;
+      }
+    } catch (networkError) {
+      console.warn('送出失敗或逾時：', networkError);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function resetButton() {
+    $('submit').disabled = false;
+    $('submit').textContent = '送出報名';
   }
 
   form.addEventListener('submit', async (event) => {
@@ -214,22 +255,27 @@
     showError('');
     $('submit').disabled = true;
     $('submit').textContent = '送出中…';
-    try {
-      // text/plain 可避免瀏覽器先發 OPTIONS 預檢，GAS 不支援預檢
-      const res = await fetch(GAS_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ action: 'signup', idToken: liff.getIDToken(), form: data })
-      });
-      const result = await res.json();
-      if (!result.ok) throw new Error(result.error || '報名沒有成功送出');
+    if (!submissionId) submissionId = newSubmissionId();
+
+    const payload = () => ({ action: 'signup', submissionId, idToken: liff.getIDToken(), form: data });
+    let result = await postSignup(payload());
+    if (!result) {
+      // 結果未知時自動重送一次；同一個送出編號不會重複寫入
+      $('submit').textContent = '確認中…';
+      result = await postSignup(payload());
+    }
+
+    if (result && result.ok) {
       form.hidden = true;
       $('done').hidden = false;
-    } catch (err) {
-      showError(err.message || '報名沒有成功送出，請檢查網路後再試一次');
-      $('submit').disabled = false;
-      $('submit').textContent = '送出報名';
+      return;
     }
+    if (result) {
+      showError(result.error || '報名沒有成功送出，請稍後再試');
+    } else {
+      showError('目前無法確認結果。若 LINE 已收到「報名成功」訊息即代表完成；若沒有，請再按一次送出，不會重複報名。');
+    }
+    resetButton();
   });
 
   $('close').addEventListener('click', () => {
